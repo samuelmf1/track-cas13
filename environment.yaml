@@ -1,0 +1,25 @@
+name: track
+channels:
+  - defaults
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - cudatoolkit=11.2
+  - samtools
+  - bowtie
+  - pip
+  - pip:
+    - tensorflow==2.11.0
+    - numpy<1.24
+    - pandas
+    - scipy
+    - matplotlib
+    - seaborn
+    - tqdm
+    - biopython
+    - scikit-learn
+    - statsmodels
+    - streamlit
+    - pyparsing
+    - sassy-rs
