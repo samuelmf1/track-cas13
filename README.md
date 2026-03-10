@@ -32,3 +32,4 @@ cd app
 npm run dev
 
 npm run preprocess
+npm run preprocess -- all

@@ -8,7 +8,8 @@ import os
 import sys
 import time
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Set
+import subprocess
 try:
     import sassy
     import pysam
@@ -170,11 +171,11 @@ class SelectionEngine:
         return False
 
     @classmethod
-    def select_guides(cls, df: pd.DataFrame, config: SelectionConfig, current_dist: int, min_score: float, sassy_checker: SassyChecker = None, gene_id: str = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    def select_guides(cls, df: pd.DataFrame, config: SelectionConfig, current_dist: int, min_score: float, sassy_checker: SassyChecker = None, gene_id: str = None, existing_positions: List[int] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
         stats = {'total': len(df), 'low_score': 0, 'overlap': 0, 'off_target': 0}
         if df.empty: return df, stats
         sorted_df = df.sort_values(config.score_col, ascending=False).reset_index(drop=True)
-        selected_indices, selected_positions = [], []
+        selected_indices, selected_positions = [], sorted(existing_positions) if existing_positions else []
         scores, starts = sorted_df[config.score_col].values, sorted_df[config.pos_col].values
         sequences = sorted_df['Target Sequence'].values if sassy_checker else None
 
@@ -198,124 +199,189 @@ class SelectionEngine:
         return sorted_df.iloc[selected_indices], stats
 
 class GuideSelector:
-    def __init__(self, target_n: int = 5, sassy_checker: SassyChecker = None):
+    def __init__(self, target_n: int = 5, sassy_checker: SassyChecker = None, utr_data: Dict[str, Dict[str, int]] = None):
         self.target_n = target_n
         self.sassy_checker = sassy_checker
+        self.utr_data = utr_data or {}
 
     def process_gene(self, gene_id: str, gene_df: pd.DataFrame, config: SelectionConfig, canonical_tx: str = None) -> Tuple[pd.DataFrame, List[Dict]]:
         all_tids_raw = gene_df['transcript_id_group'].dropna().unique()
-        all_transcripts = set()
-        for t in all_tids_raw:
-            all_transcripts.update(str(t).split('|'))
+        group_to_tx = {g: set(str(g).split('|')) for g in all_tids_raw}
+        all_tx_in_gene = set().union(*group_to_tx.values())
+
+        # Step 1: Prep UTR Data
+        tx_to_total_utr = {}
+        for tx in all_tx_in_gene:
+            u = self.utr_data.get(tx, {'five_prime_UTR': 0, 'three_prime_UTR': 0, 'generic': 0})
+            tx_to_total_utr[tx] = u.get('five_prime_UTR', 0) + u.get('three_prime_UTR', 0) + u.get('generic', 0)
+
+        unique_lengths = sorted(set(tx_to_total_utr.values()))
         
-        biotype = gene_df['biotype'].iloc[0] if 'biotype' in gene_df.columns else "N/A"
-        
-        score_map = {0.8: 'Q1', 0.6: 'Q2', 0.4: 'Q3', 0.2: 'Q4', 0.0: 'Q5'}
-        strategies = []
-        idx = 1
+        # Step 2: Define and Evaluate Splits
+        best_split = None
+        best_split_score = -1
 
-        for score in [0.8, 0.6]:
-            q_label = score_map[score]
-            for dist in [23, 6]:
-                strategies.append({'dist': dist, 'score': score, 'label': f"{idx:02d}_{q_label}_{dist}bp", 'idx': idx})
-                idx += 1
-        
-        for score in [0.4, 0.2, 0.0]:
-            q_label = score_map[score]
-            for dist in [23, 6]:
-                strategies.append({'dist': dist, 'score': score, 'label': f"{idx:02d}_{q_label}_{dist}bp", 'idx': idx})
-                idx += 1
-
-        selected_dfs = []
-        summary_rows = []
-
-        # We want to target every unique combination of transcripts (the powerset)
-        all_groups = gene_df['transcript_id_group'].dropna().unique()
-
-        for group_str in sorted(all_groups):
-            # Select guides that target exactly this combination of transcripts
-            pool = gene_df[gene_df['transcript_id_group'] == group_str]
-            
-            winner = None
-            best_failure_stats = None
-
-            for strat in strategies:
-                selected, stats = SelectionEngine.select_guides(pool, config, strat['dist'], strat['score'], sassy_checker=self.sassy_checker, gene_id=gene_id)
+        for i in range(len(unique_lengths)):
+            for j in range(i, len(unique_lengths)):
+                l_short_max = unique_lengths[i]
+                l_long_min = unique_lengths[j]
                 
-                if best_failure_stats is None or stats['total'] > best_failure_stats['total']:
-                    best_failure_stats = stats
+                if l_long_min - l_short_max < 50:
+                    continue
                 
-                if len(selected) == self.target_n:
-                    winner = {
-                        'df': selected.assign(result_class=strat['label'], targeted_transcript=group_str),
-                        'n_guides': len(selected),
+                u_short = {tx for tx, length in tx_to_total_utr.items() if length <= l_short_max}
+                u_long = {tx for tx, length in tx_to_total_utr.items() if length >= l_long_min}
+                
+                # Guides that target ONLY transcripts in u_short
+                pool_short = gene_df[gene_df['transcript_id_group'].apply(lambda g: group_to_tx[g].issubset(u_short))]
+                # Guides that target ONLY transcripts in u_long
+                pool_long = gene_df[gene_df['transcript_id_group'].apply(lambda g: group_to_tx[g].issubset(u_long))]
+                
+                if pool_short.empty or pool_long.empty:
+                    continue
+
+                # Try to select guides
+                current_winner_split = None
+                for strat in strategies if 'strategies' in locals() else self._get_strategies():
+                    sel_short, stats_short = SelectionEngine.select_guides(pool_short, config, strat['dist'], strat['score'], sassy_checker=self.sassy_checker, gene_id=gene_id)
+                    if sel_short.empty: continue
+                    
+                    sel_long, stats_long = SelectionEngine.select_guides(pool_long, config, strat['dist'], strat['score'], sassy_checker=self.sassy_checker, gene_id=gene_id, existing_positions=sel_short[config.pos_col].tolist())
+                    if sel_long.empty: continue
+                    
+                    # Score this split
+                    n_total = len(sel_short) + len(sel_long)
+                    # Penalize incomplete sets
+                    score = n_total
+                    if len(sel_short) < self.target_n: score -= 0.5
+                    if len(sel_long) < self.target_n: score -= 0.5
+                    
+                    # Tie-breaker: Tiger score
+                    avg_tiger = (sel_short[config.score_col].mean() + sel_long[config.score_col].mean()) / 2
+                    score += avg_tiger * 0.1
+                    
+                    current_winner_split = {
+                        'sel_short': sel_short.assign(result_class=strat['label'], targeted_transcript="Short_UTR_Ensemble"),
+                        'sel_long': sel_long.assign(result_class=strat['label'], targeted_transcript="Long_UTR_Ensemble"),
                         'label': strat['label'],
+                        'score': score,
+                        'n_short': len(sel_short),
+                        'n_long': len(sel_long),
+                        'short_ids': "|".join(sorted(u_short)),
+                        'long_ids': "|".join(sorted(u_long)),
                         'fail_reason': ""
                     }
                     break
-            
-            if not winner:
-                strat = strategies[-1]
-                selected, stats = SelectionEngine.select_guides(pool, config, strat['dist'], strat['score'], sassy_checker=self.sassy_checker, gene_id=gene_id)
                 
-                fail_reason = f"< {self.target_n} guides"
-                if best_failure_stats:
-                    if best_failure_stats['total'] < self.target_n:
-                        fail_reason = f"Insufficient candidates ({best_failure_stats['total']})"
-                    else:
-                        reasons = {k: v for k, v in best_failure_stats.items() if k != 'total'}
-                        if reasons:
-                            max_reason = max(reasons, key=reasons.get)
-                            count = reasons[max_reason]
-                            human_reasons = {'low_score': 'Low Score', 'overlap': 'Overlap', 'off_target': 'Off-target'}
-                            fail_reason = f"{human_reasons.get(max_reason, max_reason)} ({count})"
-                
-                winner = {
-                    'df': selected.assign(result_class=f"{strat['label']}_INCOMPLETE", targeted_transcript=group_str),
-                    'n_guides': len(selected),
-                    'label': f"{strat['label']}_INCOMPLETE",
-                    'fail_reason': fail_reason
-                }
-            
-            if not winner['df'].empty:
-                selected_dfs.append(winner['df'])
-            
-            expr = pool['expression_content'].max() if 'expression_content' in pool.columns else -1
-            isexpr = pool['overlaps_expressed_tx'].any() if 'overlaps_expressed_tx' in pool.columns else False
-            sum_log_median_expr_norm = pool['sum_log_median_expr_norm'].max() if 'sum_log_median_expr_norm' in pool.columns else -1 
-            ttm_priority = pool['ttm_priority'].max() if 'ttm_priority' in pool.columns else -1
-            ttm_gene_norm = pool['ttm_gene_norm'].max() if 'ttm_gene_norm' in pool.columns else -1
-            max_pct_cell_lines_expr = pool['max_pct_cell_lines_expr'].max() if 'max_pct_cell_lines_expr' in pool.columns else -1
-            max_n_cell_lines_expr = pool['max_n_cell_lines_expr'].max() if 'max_n_cell_lines_expr' in pool.columns else -1
-            
-            is_low_expression = sum_log_median_expr_norm >= 0 and sum_log_median_expr_norm < 1
-            
-            tx_list = set(group_str.split('|'))
-            overlaps_canonical = (canonical_tx in tx_list) if canonical_tx else False
-            
-            summary_info = {
-                'gene_id': gene_id, 
-                'transcript_id_targeted': group_str,
-                'biotype': biotype, 
-                'result_class': winner['label'], 
-                'expression': expr, 
-                'sum_log_median_expr_norm': sum_log_median_expr_norm, 
-                'ttm_priority': ttm_priority,
-                'ttm_gene_norm': ttm_gene_norm, 
-                'overlaps_expr': isexpr, 
-                'n_targeted_guides': winner['n_guides'],
-                'confidence_flag': 'LOW_EXPRESSION' if is_low_expression else 'HIGH_CONFIDENCE',
-                'fail_reason': winner['fail_reason'],
-                'overlaps_canonical': overlaps_canonical,
-                'max_pct_cell_lines_expr': max_pct_cell_lines_expr,
-                'max_n_cell_lines_expr': max_n_cell_lines_expr
-            }
-            summary_rows.append(summary_info)
+                if current_winner_split and current_winner_split['score'] > best_split_score:
+                    best_split = current_winner_split
+                    best_split_score = current_winner_split['score']
 
-        if selected_dfs:
-            return pd.concat(selected_dfs), summary_rows
-        
-        return pd.DataFrame(), summary_rows
+        summary_rows = []
+        biotype = gene_df['biotype'].iloc[0] if 'biotype' in gene_df.columns else "N/A"
+
+        if best_split:
+            final_df = pd.concat([best_split['sel_short'], best_split['sel_long']])
+            
+            # Create summary rows for the two ensembles
+            for side in ['Short', 'Long']:
+                prefix = side.lower()
+                sel_side = best_split[f'sel_{prefix}']
+                u_ensemble = best_split[f'{prefix}_ids'].split('|')
+                
+                # Get metrics from pool
+                ensemble_pool = gene_df[gene_df['transcript_id_group'].apply(lambda g: group_to_tx[g].issubset(set(u_ensemble)))]
+                
+                guide_expression = ensemble_pool['guide_expression'].max() if 'guide_expression' in ensemble_pool.columns else -1
+                isexpr = ensemble_pool['overlaps_expressed_tx'].any() if 'overlaps_expressed_tx' in ensemble_pool.columns else False
+                guide_expression_norm = ensemble_pool['guide_expression_norm'].max() if 'guide_expression_norm' in ensemble_pool.columns else -1
+                max_pct_cell_lines_expr = ensemble_pool['max_pct_cell_lines_expr'].max() if 'max_pct_cell_lines_expr' in ensemble_pool.columns else -1
+                max_n_cell_lines_expr = ensemble_pool['max_n_cell_lines_expr'].max() if 'max_n_cell_lines_expr' in ensemble_pool.columns else -1
+                
+                overlaps_canonical = any(tx == canonical_tx for tx in u_ensemble) if canonical_tx else False
+                is_low_expression = guide_expression >= 0 and guide_expression < 1
+
+                summary_rows.append({
+                    'gene_id': gene_id,
+                    'transcript_id_targeted': f"{side}_UTR_Ensemble",
+                    'biotype': biotype,
+                    'result_class': best_split['label'],
+                    'guide_expression': guide_expression,
+                    'guide_expression_norm': guide_expression_norm,
+                    'overlaps_expr': isexpr,
+                    'n_targeted_guides': best_split[f'n_{prefix}'],
+                    'confidence_flag': 'LOW_EXPRESSION' if is_low_expression else 'HIGH_CONFIDENCE',
+                    'fail_reason': "",
+                    'overlaps_canonical': overlaps_canonical,
+                    'max_pct_cell_lines_expr': max_pct_cell_lines_expr,
+                    'max_n_cell_lines_expr': max_n_cell_lines_expr,
+                    'ensemble_members': best_split[f'{prefix}_ids']
+                })
+            return final_df, summary_rows
+        else:
+            # Failure case
+            summary_rows.append({
+                'gene_id': gene_id,
+                'transcript_id_targeted': "No_Qualified_UTR_Split",
+                'biotype': biotype,
+                'result_class': "NONE",
+                'n_targeted_guides': 0,
+                'confidence_flag': 'FAILED',
+                'fail_reason': "No valid UTR split ≥50bp with double-sided guides"
+            })
+            return pd.DataFrame(), summary_rows
+
+    def _get_strategies(self):
+        score_map = {0.8: 'Q1', 0.6: 'Q2', 0.4: 'Q3', 0.2: 'Q4', 0.0: 'Q5'}
+        strategies = []
+        idx = 1
+        for score in [0.8, 0.6, 0.4, 0.2, 0.0]:
+            q_label = score_map[score]
+            for dist in [23, 6]:
+                strategies.append({'dist': dist, 'score': score, 'label': f"{idx:02d}_{q_label}_{dist}bp", 'idx': idx})
+                idx += 1
+        return strategies
+def load_utr_data(gtf_path: str) -> Dict[str, Dict[str, int]]:
+    utr_data = {}
+    print(f"Loading UTR data from GTF: {gtf_path}", file=sys.stderr)
+    cds_bounds = {}
+    with open(gtf_path, 'r') as f:
+        for line in f:
+            if line.startswith('#'): continue
+            parts = line.strip().split('\t')
+            if len(parts) < 9 or parts[2] != 'CDS': continue
+            match = re.search(r'transcript_id "([^"]+)"', parts[8])
+            if match:
+                tx = match.group(1)
+                start, end, strand = int(parts[3]), int(parts[4]), parts[6]
+                if tx not in cds_bounds: cds_bounds[tx] = [strand, start, end]
+                else:
+                    cds_bounds[tx][1] = min(cds_bounds[tx][1], start)
+                    cds_bounds[tx][2] = max(cds_bounds[tx][2], end)
+
+    with open(gtf_path, 'r') as f:
+        for line in f:
+            if line.startswith('#'): continue
+            parts = line.strip().split('\t')
+            if len(parts) < 9 or parts[2] not in ['UTR', 'five_prime_UTR', 'three_prime_UTR']: continue
+            match = re.search(r'transcript_id "([^"]+)"', parts[8])
+            if match:
+                tx = match.group(1)
+                start, end, length = int(parts[3]), int(parts[4]), int(parts[4]) - int(parts[3]) + 1
+                if tx not in utr_data: utr_data[tx] = {'five_prime_UTR': 0, 'three_prime_UTR': 0, 'generic': 0}
+                if parts[2] == 'five_prime_UTR': utr_data[tx]['five_prime_UTR'] += length
+                elif parts[2] == 'three_prime_UTR': utr_data[tx]['three_prime_UTR'] += length
+                else:
+                    if tx in cds_bounds:
+                        strand, cds_min, cds_max = cds_bounds[tx]
+                        if strand == '+':
+                            if end <= cds_min: utr_data[tx]['five_prime_UTR'] += length
+                            elif start >= cds_max: utr_data[tx]['three_prime_UTR'] += length
+                        else:
+                            if start >= cds_max: utr_data[tx]['five_prime_UTR'] += length
+                            elif end <= cds_min: utr_data[tx]['three_prime_UTR'] += length
+                    else: utr_data[tx]['generic'] += length
+    return utr_data
 
 def parse_position(row, tx_length_dict=None):
     try:
@@ -338,7 +404,10 @@ if __name__ == "__main__":
     parser.add_argument("--lookahead", type=int, default=0)
     parser.add_argument("--sassy_ref", help="Path to reference FASTA for off-target check")
     parser.add_argument("--sassy_cache", help="Path to cache file for disqualified rows")
+    parser.add_argument("--gtf", help="Path to GTF file for UTR length calculation")
     args = parser.parse_args()
+
+    utr_data = load_utr_data(args.gtf) if args.gtf else {}
 
     df = pd.read_csv(args.tsv, sep=None, engine='python')
     df = df.rename(columns={'Gene': 'gene_id', 'Symbol': 'transcript_id_group', 'Guide Score': 'tiger_score', 'Title': 'biotype'})
@@ -357,8 +426,11 @@ if __name__ == "__main__":
 
     df['gene_id'] = df['gene_id'].astype(str).str.strip()
     df['position'] = df.apply(parse_position, tx_length_dict=tx_length_dict, axis=1)
-    for col in ['expression_content', 'overlaps_expressed_tx', 'tags']:
-        if col not in df.columns: df[col] = 0 if col != 'tags' else ""
+    for col in ['guide_expression', 'overlaps_expressed_tx', 'tags', 'guide_expression_norm', 'max_pct_cell_lines_expr', 'max_n_cell_lines_expr']:
+        if col not in df.columns: 
+            if col == 'tags': df[col] = ""
+            elif col == 'overlaps_expressed_tx': df[col] = False
+            else: df[col] = -1
     
     config = SelectionConfig(
         target_n=args.target_n, lookahead=args.lookahead, 
@@ -372,7 +444,7 @@ if __name__ == "__main__":
         sassy_checker = SassyChecker(args.sassy_ref, args.sassy_cache)
         print(f"Loaded Sassy reference in {time.time() - start_time:.2f}s", file=sys.stderr)
 
-    selector = GuideSelector(target_n=args.target_n, sassy_checker=sassy_checker)
+    selector = GuideSelector(target_n=args.target_n, sassy_checker=sassy_checker, utr_data=utr_data)
     all_selected_dfs, summary_rows = [], []
 
     for gene_id, group in df.groupby('gene_id'):
@@ -406,7 +478,7 @@ if __name__ == "__main__":
         result_df = pd.concat(all_selected_dfs)
         result_df = result_df[
             ['Guide Sequence', 'tiger_score', 'biotype', 'gene_id', 'result_class', 'region', 'targeted_transcript',
-            'expression_content', 'sum_log_median_expr_norm', 'ttm_priority', 'ttm_gene_norm', 
+            'guide_expression', 'guide_expression_norm', 
             'max_pct_cell_lines_expr', 'max_n_cell_lines_expr',
             'overlaps_expressed_tx', 'exon_id', 'transcript_id_group', 'Symbol_Contig_Idx', 'tags']].copy()
         

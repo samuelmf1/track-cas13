@@ -289,7 +289,7 @@ def expression(
     # Use nanmedian to calculate the typical expression in the "active" lines only.
     masked_vals = np.where(linear_vals >= thresholds, linear_vals, np.nan)
     median_expr = np.nanmedian(masked_vals, axis=0)
-    log_median_expr = np.log2(median_expr + 1)
+    # median_expr = median_expr #np.log2(median_expr + 1)
 
     # 3. Basal expression indicator: >= 1 TPM in >= 1% of cell lines.
     expressed_mask = linear_vals >= tpm_threshold
@@ -303,7 +303,7 @@ def expression(
         "transcript_id_stable": [extract_stable_id(tid) for tid in o_df.columns],
         "n_expressed": n_expr.astype(int),
         "sum_expression": sum_expr,
-        "log_median_expr": log_median_expr,
+        "median_expr": median_expr,
         "is_expressed": n_expr >= n_cell_lines,
         "pce": pce
     })
@@ -311,10 +311,10 @@ def expression(
     matched_df = match_by_stable_id(mapping_df, expressed_df)
     type_df = matched_df[matched_df["biotype"] == biotype].copy()
     
-    # 4. Rationale: Ranking by 'sum_expression' (linear).
+    # 4. Rationale: Ranking by 'median_expr' (linear).
     # This identifies the dominant isoforms across the entire DepMap dataset.
     type_df["expression_rank"] = (
-        type_df.groupby("gene_id")["sum_expression"]
+        type_df.groupby("gene_id")["median_expr"]
         .rank(method="dense", ascending=False)
         .fillna(999) # Handle non-expressed transcripts
         .astype(int)
@@ -328,30 +328,42 @@ def expression(
         gene_totals_sum > 0, type_df["sum_expression"] / gene_totals_sum, 0.0
     )
 
-    # 6. Rationale: Local Relative Abundance (log_median_expr_norm).
+    # 6. Rationale: Local Relative Abundance (median_expr_norm).
     # In the high-expressing lines, what is the relative importance of this isoform?
     # This helps distinguish if an isoform is only dominant in low-expressing lines.
-    gene_totals_log_median = type_df.groupby("gene_id")["log_median_expr"].transform('sum')
-    type_df["log_median_expr_norm"] = np.where(
-        gene_totals_log_median > 0, type_df["log_median_expr"] / gene_totals_log_median, 0.0
+    gene_totals_log_median = type_df.groupby("gene_id")["median_expr"].transform('sum')
+    type_df["median_expr_norm"] = np.where(
+        gene_totals_log_median > 0, type_df["median_expr"] / gene_totals_log_median, 0.0
     )
     
-    # 7. Rationale: Targeted TPM Mass (TTM)
-    # This is the "Salient Metric." It combines coverage (efficiency) with 
-    # operational intensity (feasibility). 
-    # High Score = We target a large % of a highly expressed gene.
-    # Low Score = Either we miss the main isoforms, or the gene is barely expressed.
+    # # Optimization: Use matrix multiplication or group-by on transposed array
+    # # Create a mapping matrix: (n_transcripts, n_unique_genes)
+    # tx_to_idx = {tx: i for i, tx in enumerate(o_df.columns)}
+    # gene_to_idx = {gene: i for i, gene in enumerate(unique_genes)}
     
-    # We use the 'log_median_expr' (Top 10% median) as the weight.
-    type_df["ttm_score"] = type_df["sum_expression_norm"] * type_df["log_median_expr"]
+    # mapping_matrix = np.zeros((len(o_df.columns), len(unique_genes)))
+    # for tx, gene in expr_to_gene.items():
+    #     if tx in tx_to_idx:
+    #         mapping_matrix[tx_to_idx[tx], gene_to_idx[gene]] = 1.0
+            
+    # # Gene linear values: (n_cell_lines, n_unique_genes)
+    # gene_linear_vals = linear_vals @ mapping_matrix
+    
+    # # Calculate gene-level log median expression (Top Decile)
+    # gene_thresholds = np.percentile(gene_linear_vals, 90, axis=0)
+    # gene_masked = np.where(gene_linear_vals >= gene_thresholds, gene_linear_vals, np.nan)
+    # gene_median_linear = np.nanmedian(gene_masked, axis=0)
+    # gene_log_median = np.log2(gene_median_linear + 1)
+    
+    # # Map back to dataframe
+    # gene_expression_map = dict(zip(unique_genes, gene_log_median))
+    # type_df['gene_expression'] = type_df['gene_id'].map(gene_expression_map)
+    
+    # Final Metric: Effective TPM
+    # type_df["effective_tpm"] = type_df["transcript_mass_fraction"] * type_df["gene_expression"]
 
-    # Optional: Normalize TTM score to a 0-1 scale relative to the whole library 
-    # for easier interpretation in reports.
-    max_ttm = type_df["ttm_score"].max()
-    if max_ttm > 0:
-        type_df["ttm_priority"] = type_df["ttm_score"] / max_ttm
-    else:
-        type_df["ttm_priority"] = 0.0
+    # Legacy TTM remains for one version before full removal if needed, or we just use it for ranking.
+    # type_df["ttm_priority"] = type_df["effective_tpm"] / type_df["effective_tpm"].max() if type_df["effective_tpm"].max() > 0 else 0.0
 
     # Reset rank for non-expressed transcripts to signify they aren't viable targets.
     type_df.loc[~type_df["is_expressed"], "expression_rank"] = 0
@@ -386,12 +398,9 @@ def process_expression_results(
     # Integer and Float fills
     fill_map = {
         'n_expressed': -1,
-        'sum_expression': -1.0,
         'expression_rank': 0,
-        'sum_expression_norm': -1.0,
-        'log_median_expr': -1.0,
-        'log_median_expr_norm': -1.0,
-        'ttm_priority': -1.0,
+        'median_expr': -1.0,
+        'median_expr_norm': -1.0,
         'is_expressed': False,
         'pce': -1,
     }
@@ -409,11 +418,8 @@ def process_expression_results(
     if 'expressing_models' in df.columns:
         df['expressing_models'] = df['expressing_models'].fillna('')
 
-    df['sum_expression'] = round(df['sum_expression'], 6)
-    df['sum_expression_norm'] = round(df['sum_expression_norm'], 6)
-    df['log_median_expr'] = round(df['log_median_expr'], 6)
-    df['log_median_expr_norm'] = round(df['log_median_expr_norm'], 6)
-    df['ttm_priority'] = round(df['ttm_priority'], 6)
+    df['median_expr'] = round(df['median_expr'], 6)
+    df['median_expr_norm'] = round(df['median_expr_norm'], 6)
     df['pce'] = round(df['pce'], 6)
 
     return df
@@ -451,7 +457,9 @@ def main():
     expression_df = pd.concat([pc, lc], ignore_index=True)
     
     # Prepare lookup
-    expression_cols = ['n_expressed', 'expression_rank', 'sum_expression', 'sum_expression_norm', 'log_median_expr', 'log_median_expr_norm', 'ttm_priority', 'version_mismatch', 'is_expressed', 'pce']
+    expression_cols = [
+        'n_expressed', 'expression_rank', 'median_expr', 'median_expr_norm', 'version_mismatch', 'is_expressed', 'pce'
+    ]
     if not args.skip_models:
         expression_cols.append('expressing_models')
     expr_lookup = expression_df.set_index('transcript_id')[expression_cols]

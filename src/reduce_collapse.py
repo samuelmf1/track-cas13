@@ -51,28 +51,12 @@ def collapse_guides(expanded_df):
             'tags': ('tags', lambda x: '|'.join(sorted(set(
                 tag for tags_str in x.dropna() for tag in tags_str.split('|') if tag
             )))),
-            'expression_content': ('sum_expression_norm', sum_expression),
+            'guide_expression': ('median_expr', sum_expression),
+            'guide_expression_norm': ('median_expr_norm', sum_expression),
             'overlaps_expressed_tx': ('is_expressed', lambda x : x.any()),
-            'sum_log_median_expr': ('log_median_expr', sum_expression),
-            'sum_log_median_expr_norm': ('log_median_expr_norm', sum_expression),
-            'ttm_priority': ('ttm_priority', sum_expression),
             'max_pct_cell_lines_expr': ('pce', 'max'),
             'max_n_cell_lines_expr': ('n_expressed', 'max')
         }
-    )
-
-    # 2. Per-Gene Normalization
-
-    # We define the "Max TTM" for a gene as the intensity of its most expressed isoforms.
-    # Note: We group by 'Gene' and find the max ttm_priority existing in our collapsed set.
-    gene_max_ttm = collapse_df.groupby('Gene')['ttm_priority'].transform('max')
-    
-    # Rationale: If max_ttm is 0 or -1, the gene is unmeasured/unexpressed. 
-    # Otherwise, we scale the guide's score relative to the "best" guide for that gene.
-    collapse_df['ttm_gene_norm'] = np.where(
-        gene_max_ttm > 0,
-        (collapse_df['ttm_priority'] / gene_max_ttm).round(4),
-        collapse_df['ttm_priority'] # Preserve -1.0 or 0.0
     )
 
     return collapse_df

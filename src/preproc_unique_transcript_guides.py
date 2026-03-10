@@ -42,7 +42,7 @@ def main():
     df = df.rename(columns=rename_map)
 
     # 3. Ensure required columns exist
-    for col in ['sum_median_expression_norm', 'ntargeted_tx', 'tags', 'biotype']:
+    for col in ['guide_expression_norm', 'ntargeted_tx', 'tags', 'biotype']:
         if col not in df.columns:
             if col == 'ntargeted_tx':
                 df[col] = df['transcript_id_group'].apply(lambda x: str(x).count('|') + 1)

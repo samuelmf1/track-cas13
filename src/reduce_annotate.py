@@ -98,11 +98,9 @@ def main():
         .str.strip()
         .to_dict()
     )
-    df['sum_expression_norm'] = df['Symbol'].map(expr_df['sum_expression_norm'].to_dict()).fillna(-1)
+    df['median_expr'] = df['Symbol'].map(expr_df['median_expr'].to_dict()).fillna(-1)
+    df['median_expr_norm'] = df['Symbol'].map(expr_df['median_expr_norm'].to_dict()).fillna(-1)
     df['is_expressed'] = df['Symbol'].map(expr_df['is_expressed'].to_dict()).fillna(False)
-    df['log_median_expr'] = df['Symbol'].map(expr_df['log_median_expr'].to_dict()).fillna(-1)
-    df['log_median_expr_norm'] = df['Symbol'].map(expr_df['log_median_expr_norm'].to_dict()).fillna(-1)
-    df['ttm_priority'] = df['Symbol'].map(expr_df['ttm_priority'].to_dict()).fillna(-1)
     df['pce'] = df['Symbol'].map(expr_df['pce'].to_dict()).fillna(-1)
     df['n_expressed'] = df['Symbol'].map(expr_df['n_expressed'].to_dict()).fillna(-1)
 

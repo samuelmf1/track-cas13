@@ -305,13 +305,11 @@ class GuideSelector:
                     target_set = primary_set
                     target_group_str = "|".join(sorted(target_set))
 
-                    expr = group_df['expression_content'].iloc[0] if 'expression_content' in group_df.columns else -1
+                    guide_expression = group_df['guide_expression'].iloc[0] if 'guide_expression' in group_df.columns else -1
                     isexpr = group_df['overlaps_expressed_tx'].iloc[0] if 'overlaps_expressed_tx' in group_df.columns else False
-                    sum_log_median_expr_norm = group_df['sum_log_median_expr_norm'].iloc[0] if 'sum_log_median_expr_norm' in group_df.columns else -1 
-                    ttm_priority = group_df['ttm_priority'].iloc[0] if 'ttm_priority' in group_df.columns else -1
-                    ttm_gene_norm = group_df['ttm_gene_norm'].iloc[0] if 'ttm_gene_norm' in group_df.columns else -1
-                    max_pct_cell_lines_expr = group_df['max_pct_cell_lines_expr'].iloc[0] if 'max_pct_cell_lines_expr' in group_df.columns else -1
-                    max_n_cell_lines_expr = group_df['max_n_cell_lines_expr'].iloc[0] if 'max_n_cell_lines_expr' in group_df.columns else -1
+                    guide_expression_norm = group_df['guide_expression_norm'].iloc[0] if 'guide_expression_norm' in group_df.columns else -1
+                    pce = group_df['max_pct_cell_lines_expr'].iloc[0] if 'max_pct_cell_lines_expr' in group_df.columns else -1
+                    n_expressed = group_df['max_n_cell_lines_expr'].iloc[0] if 'max_n_cell_lines_expr' in group_df.columns else -1
                     
                     is_fallback = str(tid).startswith("FALLBACK_")
                     if is_fallback:
@@ -319,38 +317,37 @@ class GuideSelector:
                     else:
                         tags = group_df['tags'].iloc[0] if 'tags' in group_df.columns and pd.notna(group_df['tags'].iloc[0]) else "None"
                     overlaps_canonical = canonical_tx in primary_set if canonical_tx else ('canonical' in tags.lower())
-                    
-                    if is_fallback:
-                        worthiness = 1
-                    elif overlaps_canonical:
-                        worthiness = 3
-                    elif expr >= 0.4:
-                        worthiness = 2
-                    else:
-                        worthiness = 0
 
                     candidates.append({
                         'df': selected.assign(result_class=strat['label']),
-                        'expression': expr, 'sum_log_median_expr_norm': sum_log_median_expr_norm, 'ttm_priority': ttm_priority, 
-                        'ttm_gene_norm': ttm_gene_norm, 'overlaps_expr':isexpr, 'n_tx': len(primary_set), 'rank': strat['idx'],
+                        'guide_expression': guide_expression, 
+                        'guide_expression_norm': guide_expression_norm, 
+                        'overlaps_expr':isexpr, 'n_tx': len(primary_set), 'rank': strat['idx'],
                         'tid': tid, 'label': strat['label'], 
                         'biotype': group_df['biotype'].iloc[0] if 'biotype' in group_df.columns else "N/A",
                         'target_group_str': "Canonical_Fallback" if is_fallback else target_group_str, 
                         'target_set': primary_set,
                         'tags': tags, 'overlaps_canonical': overlaps_canonical,
                         'is_fallback': is_fallback,
-                        'worthiness_level': worthiness,
                         'fail_reason': None,
-                        'max_pct_cell_lines_expr': max_pct_cell_lines_expr,
-                        'max_n_cell_lines_expr': max_n_cell_lines_expr
+                        'pce': pce,
+                        'n_expressed': n_expressed
                     })
             
             if current_strat_best_stats:
                 best_failure_stats = current_strat_best_stats
 
         if candidates:
-            # Sort by worthiness_level, then by existing metrics
-            candidates.sort(key=lambda x: (x['worthiness_level'], x['ttm_gene_norm'], x['expression'], x['n_tx']), reverse=True)
+            # Sorting logic:
+            # 1. Use guide_expression primarily.
+            # 2. UNLESS expression is low (norm < 1), then prioritize canonical.
+            gene_is_high_expr = any(c['guide_expression'] >= 1 for c in candidates)
+            
+            if gene_is_high_expr:
+                candidates.sort(key=lambda x: x['guide_expression'], reverse=True)
+            else:
+                candidates.sort(key=lambda x: (x['overlaps_canonical'], x['guide_expression']), reverse=True)
+            
             winner = candidates[0]
             
             # Aggregate Symbol_Contig_Idx for the selected guides
@@ -360,7 +357,7 @@ class GuideSelector:
                 mapping_list = winner['df']['Symbol_Contig_Idx'].dropna().astype(str).tolist()
             mapping_summary = ";".join(mapping_list) if mapping_list else "None"
 
-            is_low_expression = winner['sum_log_median_expr_norm'] < 1 # log2(1+1) = 1 TPM
+            is_low_expression = winner['guide_expression'] < 1 # 1 TPM
 
             # If fallback was used, the targeted group reported should ideally be the canonical transcript only
             # but we'll stick to the winner['target_group_str'] which we set above.
@@ -370,15 +367,14 @@ class GuideSelector:
                 'transcript_id_group_targeted': winner['target_group_str'],
                 'transcript_id_mapping_targeted': mapping_summary,
                 'transcript_ids_not_targeted': "|".join(all_transcripts - winner['target_set']),
-                'result_class': winner['label'], 'expression': winner['expression'], 
-                'sum_log_median_expr_norm': winner['sum_log_median_expr_norm'], 'ttm_priority': winner['ttm_priority'],
-                'ttm_gene_norm': winner['ttm_gene_norm'], 'overlaps_expr': winner['overlaps_expr'], 'n_targeted_tx': len(winner['target_set']),
+                'result_class': winner['label'], 'guide_expression': winner['guide_expression'], 
+                'guide_expression_norm': winner['guide_expression_norm'], 'overlaps_expressed_tx': winner['overlaps_expr'], 'n_targeted_tx': len(winner['target_set']),
                 'tags': winner['tags'],
-                'confidence_flag': 'LOW_EXPRESSION' if is_low_expression else 'HIGH_CONFIDENCE',
+                'confidence_flag': 'LOW_EXPRESSION' if winner['guide_expression'] < 1 else 'HIGH_CONFIDENCE',
                 'fail_reason': None,
                 'overlaps_canonical': winner['overlaps_canonical'],
-                'max_pct_cell_lines_expr': winner['max_pct_cell_lines_expr'],
-                'max_n_cell_lines_expr': winner['max_n_cell_lines_expr']
+                'max_pct_cell_lines_expr': winner['pce'],
+                'max_n_cell_lines_expr': winner['n_expressed']
             }
             return winner['df'], summary_info
 
@@ -401,8 +397,7 @@ class GuideSelector:
             'transcript_id_group_targeted': "None",
             'transcript_id_mapping_targeted': "None",
             'transcript_ids_not_targeted': "|".join(sorted(all_transcripts)),
-            'result_class': "999_failed", 'expression': -1, 'sum_log_median_expr_norm': -1, 'ttm_priority': -1,
-            'ttm_gene_norm': -1, 'overlaps_expr': -1, 'n_targeted_tx': 0, 'tags': "None",
+            'result_class': "999_failed", 'guide_expression': -1, 'guide_expression_norm': -1, 'overlaps_expressed_tx': -1, 'n_targeted_tx': 0, 'tags': "None",
             'confidence_flag': 'LOW_CONFIDENCE',
             'fail_reason': fail_reason,
             'overlaps_canonical': False,
@@ -450,8 +445,14 @@ if __name__ == "__main__":
 
     df['gene_id'] = df['gene_id'].astype(str).str.strip()
     df['position'] = df.apply(parse_position, tx_length_dict=tx_length_dict, axis=1)
-    for col in ['expression_content', 'overlaps_expressed_tx', 'tags']:
-        if col not in df.columns: df[col] = 0 if col != 'tags' else ""
+    
+    # Ensure columns exist (mapping for old and new)
+    for col in ['guide_expression', 'overlaps_expressed_tx', 'tags', 'guide_expression_norm', 'expression_rank', 'version_mismatch', 'max_pct_cell_lines_expr', 'max_n_cell_lines_expr']:
+        if col not in df.columns: 
+            if col == 'version_mismatch': df[col] = False
+            elif col == 'overlaps_expressed_tx': df[col] = False
+            elif col == 'tags': df[col] = ""
+            else: df[col] = -1
     
     config = SelectionConfig(
         target_n=args.target_n, lookahead=args.lookahead, 
@@ -510,8 +511,8 @@ if __name__ == "__main__":
         result_df = pd.concat(all_selected_dfs)
         result_df = result_df[
             ['Guide Sequence', 'tiger_score', 'biotype', 'gene_id', 'result_class', 'region', 
-            'expression_content', 'sum_log_median_expr_norm', 'ttm_priority', 'ttm_gene_norm', 
-            'max_pct_cell_lines_expr', 'max_n_cell_lines_expr',
+            'guide_expression', 'guide_expression_norm',
+            'max_pct_cell_lines_expr', 'max_n_cell_lines_expr', 'expression_rank', 'version_mismatch',
             'overlaps_expressed_tx', 'exon_id', 'transcript_id_group', 'Symbol_Contig_Idx', 'tags']].copy()
         
         guides_selected = result_df[~result_df['gene_id'].isin(excluded_genes)]

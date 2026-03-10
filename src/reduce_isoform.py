@@ -112,8 +112,12 @@ if __name__ == "__main__":
     df['position'] = df.apply(parse_position, tx_length_dict=tx_length_dict, axis=1)
     
     # Ensure columns exist
-    for col in ['expression_content', 'tags']:
-        if col not in df.columns: df[col] = 0 if col != 'tags' else ""
+    for col in ['guide_expression', 'guide_expression_norm', 'overlaps_expressed_tx', 'max_pct_cell_lines_expr', 'max_n_cell_lines_expr', 'expression_rank', 'version_mismatch', 'tags']:
+        if col not in df.columns: 
+            if col == 'version_mismatch': df[col] = False
+            elif col == 'overlaps_expressed_tx': df[col] = False
+            elif col == 'tags': df[col] = ""
+            else: df[col] = -1
 
     config = SelectionConfig(target_n=args.target_n)
     
@@ -130,8 +134,10 @@ if __name__ == "__main__":
         result_df = pd.concat(all_selected_dfs)
          # Reorder columns as in reduce_constitutive
         cols_to_keep = ['Guide Sequence', 'tiger_score', 'biotype', 'gene_id', 'result_class', 
-                        'region', 'position', 'expression_content', 'ntargeted_tx', 
-                        'nappearances', 'exon_id', 'transcript_id_group', 'tags']
+                        'region', 'position', 'guide_expression', 'guide_expression_norm', 
+                        'overlaps_expressed_tx', 'max_pct_cell_lines_expr', 'max_n_cell_lines_expr', 
+                        'expression_rank', 'version_mismatch',
+                        'ntargeted_tx', 'nappearances', 'exon_id', 'transcript_id_group', 'tags']
         # Only keep columns that actually exist
         cols_to_keep = [c for c in cols_to_keep if c in result_df.columns]
         

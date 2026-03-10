@@ -52,6 +52,7 @@ process BT_FILTER {
 
     output:
     tuple val(id), path("*.bt.csv"), emit: chunks
+    tuple val(id), path("*.bt.ot.csv"), emit: offtarget_chunks
 
     script:
     def base = bam.baseName.replaceAll(/\.bt$/, '')
@@ -222,6 +223,27 @@ process MERGE_BT_RESULTS {
     """
 }
 
+process MERGE_BT_OFFTARGET_RESULTS {
+    publishDir "datasets", mode: 'copy'
+
+    input:
+    path "inputs/*"
+
+    output:
+    path "gencode.${params.gencode_version}.bowtie.offtargets.csv", emit: merged_csv
+
+    script:
+    """
+    # Grab header from the first file alphabetically
+    FIRST_FILE=\$(ls inputs/* | head -n 1)
+    head -n 1 "\$FIRST_FILE" > gencode.${params.gencode_version}.bowtie.offtargets.csv
+
+    # Append all data, skipping headers, and sort if necessary 
+    # (Using simple sort here to mimic collectFile's sort logic)
+    tail -q -n +2 inputs/* >> gencode.${params.gencode_version}.bowtie.offtargets.csv
+    """
+}
+
 process MERGE_SA_RESULTS {
     publishDir "datasets", mode: 'copy'
 
@@ -252,6 +274,9 @@ workflow OFFTARGET {
 
     full_dataset_bt_ch = MERGE_BT_RESULTS(
         bt_postfilt.chunks.map { it[1] }.collect()
+    )
+    full_dataset_ot_ch = MERGE_BT_OFFTARGET_RESULTS(
+        bt_postfilt.offtarget_chunks.map { it[1] }.collect()
     )
 
     // sassy_ref_chunks = SASSY_SPLIT_REF(index_ch.filtered_fa)

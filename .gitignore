@@ -1,0 +1,12 @@
+app
+analysis
+work
+public
+tiger_3d4c096
+.nextflow
+.pytest_cache
+slurm*
+.nextflow.log*
+__pycache__
+datasets
+runtime
